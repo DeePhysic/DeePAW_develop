@@ -79,8 +79,8 @@ setup(
     },
     entry_points={
         "console_scripts": [
-            "deepaw-predict=deepaw.scripts.predict_dual:main",
-            "deepaw-predict-single=deepaw.scripts.predict_single:main",
+            "deepaw-server=deepaw.server.cli:server_main",
+            "deepaw-predict=deepaw.server.cli:predict_main",
             "deepaw-predict-chgcar=deepaw.scripts.predict_chgcar:main",
         ],
     },
