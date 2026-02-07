@@ -246,8 +246,19 @@ class InferenceEngine:
 
         return result
 
-    def _resolve_input(self, db_path, db_id, atoms, grid_shape):
-        """解析输入参数，返回 (atoms, nx, ny, nz)。"""
+    def _resolve_input(self, db_path, db_id, atoms, grid_shape, encut=500.0):
+        """解析输入参数，返回 (atoms, nx, ny, nz)。
+
+        Args:
+            db_path: ASE 数据库路径
+            db_id: 数据库结构 ID
+            atoms: ASE Atoms 对象
+            grid_shape: 网格尺寸 (nx, ny, nz)，None 时自动计算
+            encut: 平面波截断能 (eV)，用于自动网格计算
+
+        Returns:
+            tuple: (atoms, nx, ny, nz)
+        """
         if db_path is not None and db_id is not None:
             db = connect(db_path)
             row = db.get(id=db_id)
@@ -255,10 +266,16 @@ class InferenceEngine:
             nx, ny, nz = row.data["nx"], row.data["ny"], row.data["nz"]
             return atoms, nx, ny, nz
 
-        if atoms is not None and grid_shape is not None:
-            nx, ny, nz = grid_shape
+        if atoms is not None:
+            if grid_shape is None:
+                # 自动计算网格尺寸
+                from deepaw.utils import calculate_grid_size
+                nx, ny, nz = calculate_grid_size(atoms, encut=encut)
+                print(f"自动计算网格尺寸: {nx}x{ny}x{nz} (ENCUT={encut} eV)")
+            else:
+                nx, ny, nz = grid_shape
             return atoms, nx, ny, nz
 
         raise ValueError(
-            "必须提供 (db_path + db_id) 或 (atoms + grid_shape) 之一"
+            "必须提供 (db_path + db_id) 或 atoms 之一"
         )
