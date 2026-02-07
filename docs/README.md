@@ -33,6 +33,15 @@ This directory contains comprehensive documentation for the DeePAW project.
   - VASP CHGCAR format
   - Output file structure
 
+### Advanced Features
+
+- **[server/SERVER_GUIDE.md](server/SERVER_GUIDE.md)** - 推理服务器使用指南
+  - 模型常驻 GPU，消除重复加载开销
+  - Unix socket 本地调用 + HTTP API 远程调用
+  - CLI 命令：`deepaw-server start/stop/status`、`deepaw-predict`
+  - Python API：`DeePAWClient`
+  - 后台运行、torch.compile 加速
+
 ### Technical Documentation
 
 - **[PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md)** - Project architecture
@@ -72,6 +81,11 @@ This directory contains comprehensive documentation for the DeePAW project.
 1. **Use [external_prediction_tutorial.ipynb](external_prediction_tutorial.ipynb)** as template
 2. Adapt the prediction functions to your workflow
 3. Refer to [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) for architecture details
+
+### For High-Throughput / Production Use
+1. Read [server/SERVER_GUIDE.md](server/SERVER_GUIDE.md) for persistent inference server
+2. Start with `deepaw-server start`, predict with `deepaw-predict`
+3. Use HTTP API for remote or cross-machine access
 
 ## 📖 Main README
 
@@ -114,5 +128,5 @@ If you have questions:
 
 ---
 
-**Last Updated**: 2025-11-24
+**Last Updated**: 2025-02-08
 
