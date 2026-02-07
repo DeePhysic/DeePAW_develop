@@ -10,6 +10,13 @@ from ase.db import connect
 from scipy.spatial import KDTree, cKDTree
 from scipy.spatial.distance import euclidean
 
+# GPU 图构建后端（可选依赖）
+try:
+    from torch_cluster import radius as tc_radius
+    HAS_TORCH_CLUSTER = True
+except ImportError:
+    HAS_TORCH_CLUSTER = False
+
 # DeePAW imports
 # DeePAW imports
 # Inline implementation of pad_and_stack (was in layer.py)
@@ -39,13 +46,31 @@ class DensityData(torch.utils.data.Dataset):
 
 
 class GraphConstructor(object):
-    def __init__(self, cutoff, num_probes=None, disable_pbc=True, sorted_edges=False):
+    def __init__(self, cutoff, num_probes=None, disable_pbc=True, sorted_edges=False,
+                 use_gpu_graph=None, device=None):
         super().__init__()
         self.cutoff = cutoff
         self.disable_pbc = disable_pbc
         self.sorted_edges = sorted_edges
         self.default_type = torch.get_default_dtype()
         self.num_probes = num_probes
+
+        # GPU 图构建后端
+        if use_gpu_graph is True and not HAS_TORCH_CLUSTER:
+            raise ImportError(
+                "use_gpu_graph=True 但 torch_cluster 未安装。"
+                "请安装: pip install torch-cluster"
+            )
+        if use_gpu_graph is None:
+            # 自动检测：有 torch_cluster + CUDA 设备就用 GPU
+            self._use_gpu_graph = (
+                HAS_TORCH_CLUSTER
+                and device is not None
+                and "cuda" in str(device)
+            )
+        else:
+            self._use_gpu_graph = use_gpu_graph
+        self._device = device
 
     def __call__(self,
         density,
@@ -141,7 +166,6 @@ class GraphConstructor(object):
         supercell_atom_idx = np.repeat(atom_idx[:, None], total_repeats, axis=-1)
         supercell_atom_positions = supercell_atom_pos.reshape(-1, 3)
         supercell_atom_idx_flat = supercell_atom_idx.reshape(-1)
-        atom_kdtree = KDTree(supercell_atom_positions)
 
         # 预创建不变的 tensor
         nodes_tensor = torch.tensor(atoms.get_atomic_numbers())
@@ -151,13 +175,12 @@ class GraphConstructor(object):
         atom_xyz_tensor = torch.tensor(atoms.get_positions(), dtype=self.default_type)
         cell_tensor = torch.tensor(np.array(atoms.get_cell()), dtype=self.default_type)
 
-        return {
+        cache = {
             'atoms': atoms,
             'atom_positions': atom_positions,
             'inv_cell_T': inv_cell_T,
             'supercell_atom_positions': supercell_atom_positions,
             'supercell_atom_idx': supercell_atom_idx_flat,
-            'atom_kdtree': atom_kdtree,
             'nodes': nodes_tensor,
             'atom_edges': atom_edges_tensor,
             'atom_edges_displacement': atom_edges_disp_tensor,
@@ -167,30 +190,32 @@ class GraphConstructor(object):
             'num_atom_edges': torch.tensor(atom_edges_tensor.shape[0]),
         }
 
+        if self._use_gpu_graph:
+            # GPU 模式：缓存 GPU tensor，不建 KDTree
+            dev = self._device
+            cache['supercell_atom_positions_gpu'] = torch.tensor(
+                supercell_atom_positions, dtype=self.default_type, device=dev)
+            cache['supercell_atom_idx_gpu'] = torch.tensor(
+                supercell_atom_idx_flat, dtype=torch.long, device=dev)
+            cache['atom_positions_gpu'] = torch.tensor(
+                atom_positions, dtype=self.default_type, device=dev)
+            cache['inv_cell_T_gpu'] = torch.tensor(
+                inv_cell_T, dtype=self.default_type, device=dev)
+        else:
+            # CPU 模式：建 KDTree
+            cache['atom_kdtree'] = KDTree(supercell_atom_positions)
+
+        return cache
+
     def build_graph_with_cache(self, density, grid_pos, cache, inference=False):
         """使用预计算缓存构建图，只计算 probe 相关部分"""
         probe_pos = grid_pos.reshape(-1, 3)
         num_probes = probe_pos.shape[0]
 
-        # 只构建 probe KDTree 和查询
-        probe_kdtree = KDTree(probe_pos)
-        query = probe_kdtree.query_ball_tree(cache['atom_kdtree'], r=self.cutoff)
-
-        edges_per_probe = np.array([len(q) for q in query])
-        dest_node_idx = np.repeat(np.arange(len(edges_per_probe)), edges_per_probe)
-        supercell_neigh_idx = np.concatenate(query).astype(int)
-        src_node_idx = cache['supercell_atom_idx'][supercell_neigh_idx]
-        probe_edges = np.stack((src_node_idx, dest_node_idx), axis=1)
-
-        atom_positions = cache['atom_positions']
-        supercell_atom_positions = cache['supercell_atom_positions']
-        inv_cell_T = cache['inv_cell_T']
-
-        src_pos = atom_positions[src_node_idx]
-        dest_pos = probe_pos[dest_node_idx]
-        neigh_vecs = supercell_atom_positions[supercell_neigh_idx] - dest_pos
-        neigh_origin = neigh_vecs + dest_pos - src_pos
-        probe_edges_displacement = np.round(inv_cell_T.dot(neigh_origin.T).T)
+        if self._use_gpu_graph:
+            probe_edges, probe_edges_displacement = self._build_graph_gpu(probe_pos, cache)
+        else:
+            probe_edges, probe_edges_displacement = self._build_graph_kdtree(probe_pos, cache)
 
         graph_dict = {
             "nodes": cache['nodes'],
@@ -211,6 +236,69 @@ class GraphConstructor(object):
             probe_target = density.flatten()
             graph_dict["probe_target"] = torch.tensor(probe_target, dtype=self.default_type)
         return graph_dict
+
+    def _build_graph_kdtree(self, probe_pos, cache):
+        """CPU KDTree 后端：scipy KDTree 邻居搜索"""
+        probe_kdtree = KDTree(probe_pos)
+        query = probe_kdtree.query_ball_tree(cache['atom_kdtree'], r=self.cutoff)
+
+        edges_per_probe = np.array([len(q) for q in query])
+        dest_node_idx = np.repeat(np.arange(len(edges_per_probe)), edges_per_probe)
+        supercell_neigh_idx = np.concatenate(query).astype(int)
+        src_node_idx = cache['supercell_atom_idx'][supercell_neigh_idx]
+        probe_edges = np.stack((src_node_idx, dest_node_idx), axis=1)
+
+        atom_positions = cache['atom_positions']
+        supercell_atom_positions = cache['supercell_atom_positions']
+        inv_cell_T = cache['inv_cell_T']
+
+        src_pos = atom_positions[src_node_idx]
+        dest_pos = probe_pos[dest_node_idx]
+        neigh_vecs = supercell_atom_positions[supercell_neigh_idx] - dest_pos
+        neigh_origin = neigh_vecs + dest_pos - src_pos
+        probe_edges_displacement = np.round(inv_cell_T.dot(neigh_origin.T).T)
+
+        return probe_edges, probe_edges_displacement
+
+    def _build_graph_gpu(self, probe_pos, cache):
+        """GPU torch_cluster 后端：CUDA 加速邻居搜索"""
+        dev = self._device
+        probe_pos_gpu = torch.tensor(probe_pos, dtype=self.default_type, device=dev)
+        supercell_pos_gpu = cache['supercell_atom_positions_gpu']
+
+        # torch_cluster.radius: 找 y 中每个点在 x 中的邻居
+        # 返回 edge_index: [2, num_edges], row=y_idx(probe), col=x_idx(supercell_atom)
+        # 注意: torch_cluster 用 strict < ，scipy 用 <=，加 epsilon 保持一致
+        edge_index = tc_radius(
+            x=supercell_pos_gpu,
+            y=probe_pos_gpu,
+            r=self.cutoff + 1e-6,
+        )
+        probe_idx = edge_index[0]          # probe 索引
+        supercell_neigh_idx = edge_index[1]  # 超胞原子索引
+
+        # 映射回原始原子索引
+        src_node_idx = cache['supercell_atom_idx_gpu'][supercell_neigh_idx]
+
+        # GPU 上计算 displacement
+        atom_pos_gpu = cache['atom_positions_gpu']
+        inv_cell_T_gpu = cache['inv_cell_T_gpu']
+
+        src_pos = atom_pos_gpu[src_node_idx]
+        dest_pos = probe_pos_gpu[probe_idx]
+        neigh_vecs = supercell_pos_gpu[supercell_neigh_idx] - dest_pos
+        neigh_origin = neigh_vecs + dest_pos - src_pos
+        probe_edges_displacement_gpu = torch.round(
+            (inv_cell_T_gpu @ neigh_origin.T).T
+        )
+
+        # 转回 numpy
+        probe_edges = torch.stack(
+            (src_node_idx, probe_idx), dim=1
+        ).cpu().numpy()
+        probe_edges_displacement = probe_edges_displacement_gpu.cpu().numpy()
+
+        return probe_edges, probe_edges_displacement
 
     def atoms_and_probes_to_graph(self, atoms, probe_pos):
         atom_edges, atom_edges_displacement, neighborlist, inv_cell_T = self.atoms_to_graph(atoms)
@@ -295,11 +383,11 @@ class GraphConstructor(object):
         total_repeats = repeat_offsets.shape[0]
         # project repeat cell offsets into cartesian space
         repeat_offsets = np.dot(repeat_offsets, atoms.get_cell())
-        # tile grid positions, subtract offsets 
+        # tile grid positions, subtract offsets
         # (subtracting grid positions is like adding atom positions)
         supercell_atom_pos = np.repeat(atom_positions[..., None, :], total_repeats, axis=-2)
         supercell_atom_pos += repeat_offsets
-        
+
         # store the original index of each atom
         supercell_atom_idx = np.repeat(atom_idx[:, None], total_repeats, axis=-1)
 
@@ -307,33 +395,67 @@ class GraphConstructor(object):
         supercell_atom_positions = supercell_atom_pos.reshape(np.prod(supercell_atom_pos.shape[:2]), 3)
         supercell_atom_idx = supercell_atom_idx.reshape(np.prod(supercell_atom_pos.shape[:2]))
 
-        # create KDTrees for atoms and probes
-        atom_kdtree = KDTree(supercell_atom_positions)
-        probe_kdtree = KDTree(probe_pos)
+        if self._use_gpu_graph:
+            # GPU 后端
+            dev = self._device
+            probe_pos_gpu = torch.tensor(probe_pos, dtype=self.default_type, device=dev)
+            supercell_pos_gpu = torch.tensor(
+                supercell_atom_positions, dtype=self.default_type, device=dev)
+            supercell_idx_gpu = torch.tensor(
+                supercell_atom_idx, dtype=torch.long, device=dev)
+            atom_pos_gpu = torch.tensor(
+                atom_positions, dtype=self.default_type, device=dev)
+            inv_cell_T_gpu = torch.tensor(
+                inv_cell_T, dtype=self.default_type, device=dev)
 
-        # query points between kd tree
-        query = probe_kdtree.query_ball_tree(atom_kdtree, r=self.cutoff)
+            edge_index = tc_radius(
+                x=supercell_pos_gpu,
+                y=probe_pos_gpu,
+                r=self.cutoff + 1e-6,
+            )
+            probe_idx = edge_index[0]
+            supercell_neigh_idx = edge_index[1]
 
-        # set up vector of destination nodes (probes)
-        edges_per_probe = np.array([len(q) for q in query])
-        dest_node_idx = np.repeat(np.arange(len(edges_per_probe)), edges_per_probe)
+            src_node_idx = supercell_idx_gpu[supercell_neigh_idx]
+            src_pos = atom_pos_gpu[src_node_idx]
+            dest_pos = probe_pos_gpu[probe_idx]
+            neigh_vecs = supercell_pos_gpu[supercell_neigh_idx] - dest_pos
+            neigh_origin = neigh_vecs + dest_pos - src_pos
+            probe_edges_displacement_gpu = torch.round(
+                (inv_cell_T_gpu @ neigh_origin.T).T
+            )
 
-        # get original atom idx from supercell idx
-        supercell_neigh_idx = np.concatenate(query).astype(int)
-        src_node_idx = supercell_atom_idx[supercell_neigh_idx]
-        # create edges from src/dest nodes
-        probe_edges = np.stack((src_node_idx, dest_node_idx), axis=1)
+            probe_edges = torch.stack(
+                (src_node_idx, probe_idx), dim=1
+            ).cpu().numpy()
+            probe_edges_displacement = probe_edges_displacement_gpu.cpu().numpy()
+        else:
+            # CPU KDTree 后端
+            atom_kdtree = KDTree(supercell_atom_positions)
+            probe_kdtree = KDTree(probe_pos)
 
-        # get non-supercell atom positions
-        src_pos = atom_positions[src_node_idx]
-        dest_pos = probe_pos[dest_node_idx]
+            # query points between kd tree
+            query = probe_kdtree.query_ball_tree(atom_kdtree, r=self.cutoff)
 
-        # FIXME: on the next two lines, what is the purpose of dest_pos? 
-        # edge vector between supercell atoms and probe
-        neigh_vecs = supercell_atom_positions[supercell_neigh_idx] - dest_pos
-        # compute displacement (number of unitcells in each dim)
-        neigh_origin = neigh_vecs + dest_pos - src_pos
-        probe_edges_displacement = np.round(inv_cell_T.dot(neigh_origin.T).T)
+            # set up vector of destination nodes (probes)
+            edges_per_probe = np.array([len(q) for q in query])
+            dest_node_idx = np.repeat(np.arange(len(edges_per_probe)), edges_per_probe)
+
+            # get original atom idx from supercell idx
+            supercell_neigh_idx = np.concatenate(query).astype(int)
+            src_node_idx = supercell_atom_idx[supercell_neigh_idx]
+            # create edges from src/dest nodes
+            probe_edges = np.stack((src_node_idx, dest_node_idx), axis=1)
+
+            # get non-supercell atom positions
+            src_pos = atom_positions[src_node_idx]
+            dest_pos = probe_pos[dest_node_idx]
+
+            # edge vector between supercell atoms and probe
+            neigh_vecs = supercell_atom_positions[supercell_neigh_idx] - dest_pos
+            # compute displacement (number of unitcells in each dim)
+            neigh_origin = neigh_vecs + dest_pos - src_pos
+            probe_edges_displacement = np.round(inv_cell_T.dot(neigh_origin.T).T)
 
         return probe_edges, probe_edges_displacement
 

@@ -40,6 +40,7 @@ GRAPH_CONSTRUCTION_DEFAULTS = {
     "cutoff": 4.0,              # Cutoff radius for neighbor search (Angstroms)
     "num_probes": None,         # Number of probe points (None = use all grid points)
     "max_neighbors": 20,        # Maximum number of neighbors per atom
+    "use_gpu_graph": None,      # GPU graph construction (None=auto, True=force, False=disable)
 }
 
 # Data Loading Parameters

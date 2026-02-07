@@ -68,6 +68,9 @@ setup(
         "gpu": [
             "accelerate>=0.20.0",
         ],
+        "gpu-graph": [
+            "torch-cluster",
+        ],
         "all": [
             "pytest>=7.0.0",
             "black>=22.0.0",
@@ -75,6 +78,7 @@ setup(
             "flake8>=4.0.0",
             "mypy>=0.950",
             "accelerate>=0.20.0",
+            "torch-cluster",
         ],
     },
     entry_points={

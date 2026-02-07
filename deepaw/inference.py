@@ -38,6 +38,7 @@ class InferenceEngine:
         data_batch_size: 每批 probe 点数量，受 GPU 显存限制 (24GB GPU 建议 3000)
         use_dual_model: 是否使用 F_local 修正模型 (更高精度)
         use_compile: 是否使用 torch.compile 加速 probe_model (约 1.14x 加速)
+        use_gpu_graph: 是否使用 GPU 加速图构建 (None=自动, True=强制, False=禁用)
     """
 
     def __init__(
@@ -48,6 +49,7 @@ class InferenceEngine:
         data_batch_size=3000,
         use_dual_model=True,
         use_compile=True,
+        use_gpu_graph=None,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -56,6 +58,7 @@ class InferenceEngine:
         self.data_batch_size = data_batch_size
         self.use_dual_model = use_dual_model
         self.use_compile = use_compile and (device != "cpu")
+        self.use_gpu_graph = use_gpu_graph
 
         # 确定 checkpoint 目录
         if checkpoint_dir is None:
@@ -120,7 +123,8 @@ class InferenceEngine:
             self.f_local = None
 
         self._graph_constructor = GraphConstructor(
-            cutoff=self.cutoff, num_probes=None, disable_pbc=False
+            cutoff=self.cutoff, num_probes=None, disable_pbc=False,
+            use_gpu_graph=self.use_gpu_graph, device=self.device,
         )
 
     def predict(self, db_path=None, db_id=None, atoms=None, grid_shape=None):
