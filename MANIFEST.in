@@ -1,0 +1,10 @@
+include README_NEW.md
+include LICENSE
+include requirements.txt
+include environment.yml
+recursive-include deepaw *.py
+recursive-include checkpoints *.pth
+recursive-include examples *.py
+recursive-include tests *.py
+recursive-include docs *.md
+

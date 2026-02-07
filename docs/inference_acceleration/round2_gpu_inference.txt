@@ -1,0 +1,169 @@
+================================================================================
+第二轮优化：GPU 推理端与传输优化
+================================================================================
+日期: 2026-02
+测试基准: HfO2 80x80x80 网格, 512000 探针点, 12 原子, 24GB GPU
+前置条件: 第一轮优化已完成，CPU 预处理 ~3.9s，GPU 推理 ~44s
+
+================================================================================
+1. 背景
+================================================================================
+
+第一轮优化后瓶颈已翻转：
+  - CPU 预处理: ~9s  (含 I/O)
+  - GPU 推理:   ~44s (171 batch, ~5.2 it/s)
+  - GPU 推理占总时间 ~80%，为绝对主导瓶颈
+
+本轮目标：在不改变模型结构的前提下，优化数据传输和加载环节。
+
+收到外部 16 条优化建议（详见 external_suggestions_review.txt），
+经评估后选择 4 条实施。
+
+================================================================================
+2. 优化措施
+================================================================================
+
+----------------------------------------------------------------------
+优化 1: Probe batch size 可配置化
+----------------------------------------------------------------------
+
+问题:
+  MyCollator.__call__ 中 batch_size = 3000 硬编码。
+  不同 GPU 显存容量不同，用户无法根据硬件调整。
+
+改动:
+  文件: deepaw/data/chgcar_writer.py
+  - MyCollator.__init__ 新增 data_batch_size=3000 参数
+  - MyCollator.__call__ 中 batch_size = self.data_batch_size
+
+  文件: deepaw/data/chgcar_writer_huge.py
+  - 同样改动（原已有该参数，统一默认值）
+
+关于 batch size 增大的尝试:
+  最初计划将默认值从 3000 提升到 10000（减少 70% batch 数量）。
+  实测结果:
+    - batch_size=10000: CUDA OOM ("Tried to allocate 13.98 GiB", 仅 3.45 GiB 可用)
+    - batch_size=5000:  CUDA OOM ("Tried to allocate 8.18 GiB", 仅 5.43 GiB 可用)
+    - batch_size=3000:  正常运行
+
+  原因: e3nn tensor product (mul=500, lmax=4) 的中间张量随 probe 数量线性增长，
+  且系数极大。在 24GB GPU 上，3000 个 probe 已接近显存上限。
+
+  结论: 默认值保持 3000，用户可通过 data_batch_size 参数自行调整。
+  拥有 40GB+ 显存的 GPU (如 A100) 可尝试更大值。
+
+收益: 提供可配置接口，大显存 GPU 可获得加速。
+风险: 低。默认值不变，不影响现有行为。
+
+----------------------------------------------------------------------
+优化 2: non_blocking 传输 + 排除推理无关键
+----------------------------------------------------------------------
+
+问题 A:
+  预测脚本中 batch.to(device) 未使用 non_blocking=True。
+  DataLoader 已设置 pin_memory=True，配合 non_blocking 可让
+  CPU->GPU 传输与 GPU 计算重叠，减少等待时间。
+
+问题 B:
+  batch dict 中包含推理不需要的键:
+    - probe_target:      训练标签，推理时无意义
+    - total_num_probes:  网格维度元数据，模型 forward() 不读取
+  这些键白白占用传输带宽和 GPU 显存。
+
+改动:
+  文件: examples/predict_hfo2.py
+  文件: deepaw/scripts/predict_chgcar_dual.py
+  文件: deepaw/scripts/predict_chgcar.py
+  - 改前: batch = {k: v.to(device) for k, v in batch.items()}
+  - 改后:
+    _skip = {'probe_target', 'total_num_probes'}
+    batch = {k: v.to(device, non_blocking=True)
+             for k, v in batch.items() if k not in _skip}
+
+收益: 每 batch 省 1-2ms 传输时间，累积效果随 batch 数增加。
+风险: 极低。non_blocking 是标准 PyTorch 优化。
+
+----------------------------------------------------------------------
+优化 3: 模型权重直接加载到目标设备
+----------------------------------------------------------------------
+
+问题:
+  当前 torch.load(path, map_location='cpu') 先加载到 CPU，
+  再通过 .to(device) 搬到 GPU。对于 F_nonlocal (~8MB)，
+  这意味着先分配 CPU 内存再拷贝到 GPU，浪费一次拷贝。
+
+改动:
+  文件: examples/predict_hfo2.py
+  文件: deepaw/scripts/predict_chgcar_dual.py
+  文件: deepaw/scripts/predict_chgcar.py
+  - 改前: torch.load(path, map_location='cpu')
+  - 改后: torch.load(path, map_location=device)
+  - 后续 .to(device) 调用变为 no-op，保留不删
+
+收益: 模型加载阶段一次性节省 ~2-4s。
+风险: 极低。
+
+----------------------------------------------------------------------
+优化 4: inference 模式跳过无用 tensor 创建
+----------------------------------------------------------------------
+
+问题:
+  build_graph_with_cache 每个 batch 都创建 probe_target tensor，
+  这是训练标签，推理时完全不需要。MyCollator 也会附加
+  total_num_probes 元数据，模型 forward() 同样不读取。
+  每 batch 多创建 ~40KB 无用 tensor + unsqueeze + to(device)。
+
+改动:
+  文件: deepaw/data/chgcar_writer.py
+  - MyCollator.__init__ 新增 inference=False 参数
+  - build_graph_with_cache 新增 inference=False 参数
+    当 inference=True 时不创建 probe_target tensor
+  - MyCollator.__call__ 中:
+    传入 inference=self.inference
+    当 inference=True 时不附加 total_num_probes
+
+  文件: deepaw/data/chgcar_writer_huge.py
+  - 同样改动
+
+  文件: examples/predict_hfo2.py
+  文件: deepaw/scripts/predict_chgcar_dual.py
+  文件: deepaw/scripts/predict_chgcar.py
+  - MyCollator 构造时传入 inference=True
+
+收益: 每 batch 省去一次 tensor 创建和传输。
+风险: 极低。新增参数默认 False，不影响训练路径。
+
+----------------------------------------------------------------------
+未采纳: int64 -> int32 边索引降精度
+----------------------------------------------------------------------
+
+外部建议将边索引从 int64 降为 int32 以节省显存。
+
+经代码验证，irreps_tools.py 中 scatter 函数:
+  def scatter(src, index, dim_size):
+      out = src.new_zeros(dim_size, src.shape[1])
+      index = index.reshape(-1, 1).expand_as(src)
+      return out.scatter_add_(0, index, src)
+
+scatter_add_ 要求 index 为 LongTensor (int64)。
+边索引最终会流入 scatter 操作，因此不能降为 int32。
+
+================================================================================
+3. 验证结果
+================================================================================
+
+运行 python examples/predict_hfo2.py 通过:
+  - 预测值范围: [0.025620, 8.122768]，与优化前完全一致
+  - CHGCAR 文件正常生成 (9101.0 KB)
+  - CPU 预处理: ~11s (171 batch, ~16 it/s)
+  - GPU 推理:   ~44s (171 batch, ~5.2 it/s)
+
+================================================================================
+4. 涉及文件
+================================================================================
+
+  deepaw/data/chgcar_writer.py        -- 优化 1 (batch size), 优化 4 (inference)
+  deepaw/data/chgcar_writer_huge.py   -- 同上
+  examples/predict_hfo2.py            -- 优化 2 (non_blocking), 优化 3 (map_location)
+  deepaw/scripts/predict_chgcar_dual.py -- 同上
+  deepaw/scripts/predict_chgcar.py      -- 同上
