@@ -21,7 +21,6 @@ import numpy as np
 from tqdm import tqdm
 from ase.db import connect
 
-from deepaw import F_nonlocal, F_local
 from deepaw.data.chgcar_writer import GraphConstructor, get_grid_centers
 from deepaw.config import get_model_config, get_checkpoint_path
 
@@ -38,6 +37,7 @@ class InferenceEngine:
         cutoff: 邻居搜索截断半径 (Angstrom)
         data_batch_size: 每批 probe 点数量，受 GPU 显存限制 (24GB GPU 建议 3000)
         use_dual_model: 是否使用 F_local 修正模型 (更高精度)
+        use_compile: 是否使用 torch.compile 加速 probe_model (约 1.14x 加速)
     """
 
     def __init__(
@@ -47,6 +47,7 @@ class InferenceEngine:
         cutoff=4.0,
         data_batch_size=3000,
         use_dual_model=True,
+        use_compile=True,
     ):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -54,6 +55,7 @@ class InferenceEngine:
         self.cutoff = cutoff
         self.data_batch_size = data_batch_size
         self.use_dual_model = use_dual_model
+        self.use_compile = use_compile and (device != "cpu")
 
         # 确定 checkpoint 目录
         if checkpoint_dir is None:
@@ -68,6 +70,16 @@ class InferenceEngine:
 
     def _load_models(self):
         """加载模型权重到目标设备并保持常驻。"""
+        import e3nn
+
+        # 使用 eager 模式替代 TorchScript，允许 torch.compile 优化
+        if self.use_compile:
+            e3nn.set_optimization_defaults(jit_mode='eager')
+
+        # 延迟导入，确保 e3nn 优化设置已生效
+        from deepaw.models.f_nonlocal import F_nonlocal
+        from deepaw.models.f_local import F_local
+
         f_nonlocal_config = get_model_config("f_nonlocal")
         self.f_nonlocal = F_nonlocal(**f_nonlocal_config).to(self.device)
 
@@ -76,10 +88,19 @@ class InferenceEngine:
         )
         if not os.path.exists(path_nonlocal):
             raise FileNotFoundError(f"F_nonlocal 权重不存在: {path_nonlocal}")
+
+        # eager 模式下 state_dict 不含 _w3j Clebsch-Gordan 系数，需 strict=False
+        strict = not self.use_compile
         self.f_nonlocal.load_state_dict(
-            torch.load(path_nonlocal, map_location=self.device)
+            torch.load(path_nonlocal, map_location=self.device), strict=strict
         )
         self.f_nonlocal.eval()
+
+        # torch.compile 加速 probe_model（占 GPU 推理时间 ~89%）
+        if self.use_compile:
+            self.f_nonlocal.probe_model = torch.compile(
+                self.f_nonlocal.probe_model, mode='default', fullgraph=False
+            )
 
         if self.use_dual_model:
             f_local_config = get_model_config("f_local")
