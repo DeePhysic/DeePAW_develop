@@ -13,11 +13,13 @@ __url__ = "https://github.com/your-repo/DeePAW"
 from .models.f_nonlocal import F_nonlocal
 from .models.f_local import F_local
 from .inference import InferenceEngine
+from .hirshfeld import HirshfeldAnalysis
 
 __all__ = [
     "F_nonlocal",
     "F_local",
     "InferenceEngine",
+    "HirshfeldAnalysis",
     "__version__",
 ]
 

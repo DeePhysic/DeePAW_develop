@@ -87,6 +87,7 @@ setup(
             "deepaw-server=deepaw.server.cli:server_main",
             "deepaw-predict=deepaw.server.cli:predict_main",
             "deepaw-predict-chgcar=deepaw.scripts.predict_chgcar:main",
+            "deepaw-hirshfeld=deepaw.hirshfeld.cli:main",
         ],
     },
     include_package_data=True,
