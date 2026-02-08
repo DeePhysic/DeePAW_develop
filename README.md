@@ -2,6 +2,20 @@
 
 Deep Learning for PAW Charge Density Prediction — 开发分支。
 
+---
+
+## 📍 项目位置
+
+**服务器**: `sutianhao` 的工作站
+**绝对路径**: `/scratch/sutianhao/data/deepaw_test/DeePAW-main`
+
+```bash
+# 快速进入项目目录
+cd /scratch/sutianhao/data/deepaw_test/DeePAW-main
+```
+
+---
+
 ## 环境搭建
 
 ```bash
@@ -28,6 +42,11 @@ deepaw/
 ├── data/
 │   └── chgcar_writer.py    # 图构建 + CHGCAR I/O
 ├── inference.py             # InferenceEngine (统一推理入口)
+├── hirshfeld/               # Hirshfeld 电荷分析模块 (新增)
+│   ├── analysis.py          # HirshfeldAnalysis 主类
+│   ├── radial_lookup.py     # 径向密度查找表 (118 元素)
+│   ├── free_atom.py         # 自由原子密度提供器
+│   └── cli.py               # deepaw-hirshfeld 命令
 ├── server/                  # 推理服务器 (Unix socket + HTTP)
 │   ├── server.py            # DeePAWServer
 │   ├── client.py            # DeePAWClient
@@ -88,6 +107,11 @@ curl -X POST http://localhost:8265/predict \
 ```bash
 # 运行示例
 python examples/predict_hfo2.py
+python examples/test_hirshfeld.py  # Hirshfeld 电荷分析测试
+
+# Hirshfeld 电荷分析
+deepaw-hirshfeld analyze --poscar POSCAR --lookup-table table.npz
+deepaw-hirshfeld precompute --all --output all_elements.npz
 
 # 服务器管理
 deepaw-server start [--compile] [--daemon] [--port 8265]
@@ -111,6 +135,7 @@ e26ca93 初始版本：两轮推理加速 + InferenceEngine
 
 ## 文档
 
+- [docs/HIRSHFELD_ANALYSIS.md](docs/HIRSHFELD_ANALYSIS.md) — **Hirshfeld 电荷分析** (新增)
 - [docs/server/SERVER_GUIDE.md](docs/server/SERVER_GUIDE.md) — 推理服务器使用指南
 - [docs/inference_acceleration/](docs/inference_acceleration/) — 推理加速工作记录
 - [docs/QUICKSTART.md](docs/QUICKSTART.md) — 快速上手
